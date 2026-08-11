@@ -223,7 +223,7 @@ In the configuration examples below, `30000` is illustrative only. If `requestTi
 | `requestTimeoutMs` | Request timeout in milliseconds for live MCP calls (overrides global; if omitted or `<= 0`, the MCP SDK default timeout is used) |
 | `protocolVersion` | `"legacy"` (default), `"auto"`, or `"2026-07-28"`; modern negotiation is opt-in |
 | `exposeResources` | Expose MCP resources as tools (default: true) |
-| `directTools` | `true`, `string[]`, or `false` — register tools individually instead of through proxy |
+| `directTools` | `true`, `string[]`, or `false` — register deferred typed tools activated by `mcp` search |
 | `toolPrefix` | Override global `settings.toolPrefix` for this server (`"server"`, `"short"`, `"none"`, or `"mcp"`) |
 | `includeTools` | `string[]` of tool names or glob patterns to expose (matches original names like `get_screenshot`, generated resource names like `read_figjam`, and prefixed names like `figma_get_screenshot`) |
 | `excludeTools` | `string[]` of tool names or glob patterns to hide (applied after `includeTools`) |
@@ -330,10 +330,10 @@ When any enabled server uses `eager` or `keep-alive`, initialization also starts
 | `approveTools` | `true` to require approval before every MCP tool call, or an array of glob patterns such as `["github_delete_*", "notion_update_*"]`. Per-server `approveTools` overrides this. |
 | `oauthDir` | Legacy OAuth `tokens.json` import directory for this MCP config. Relative paths resolve from the active project cwd. `MCP_OAUTH_DIR` still wins when set. Persistent OAuth credentials are stored in the OS credential store, not this directory. |
 | `mcpServers.<name>.oauth.authorizationParams` | Extra authorization URL parameters for provider-specific OAuth extensions. Flow-owned parameters such as `client_id`, `redirect_uri`, `scope`, `state`, `code_challenge`, `response_type`, and `resource` cannot be overridden. |
-| `directTools` | Global default for all servers (default: false). Per-server overrides this. |
-| `freezeDirectTools` | Keep direct-tool registration stable after the initial sync so automatic reconnects and list-change notifications do not rebuild the system prompt. Use `mcp({ connect: "server" })` or `/mcp reconnect <server>` to refresh deliberately. Default: false. |
+| `directTools` | Global default for deferred typed tools (default: false). Per-server overrides this. |
+| `freezeDirectTools` | Keep direct-tool registration stable after the initial sync. Automatic metadata updates, including lazy search discovery and list-change notifications, do not change registrations; explicit `mcp({ connect: "server" })` and `/mcp reconnect` refresh deliberately. Default: false. |
 | `scriptMode` | Register the MCP-only `mcpScript` plain-JavaScript tool (default: true). Set to `false` to hide it. |
-| `disableProxyTool` | Hide the `mcp` proxy tool once configured direct tools are fully available from cache. |
+| `disableProxyTool` | Hide the `mcp` proxy when possible. Deferred direct tools require `mcp` search as their loader, so this setting is ignored while `directTools` is enabled. Retained for configuration compatibility. |
 | `autoAuth` | Auto-run OAuth on `connect`/tool calls when a server needs auth, then retry once (default: false). |
 | `sampling` | Allow MCP servers to sample through Pi models, honoring `modelPreferences.hints` before current/default fallback (default: true when UI approval is available). |
 | `samplingAutoApprove` | Skip sampling confirmation prompts. Required for sampling in non-UI sessions (default: false). |
@@ -457,7 +457,7 @@ URL mode is advertised only in TUI mode. The adapter displays the requesting ser
 
 ### Direct Tools
 
-By default, all MCP tools are accessed through the single `mcp` proxy tool. This keeps context small but means the LLM has to discover MCP tools via proxy search. If you want specific tools to show up directly in the agent's tool list — alongside `read`, `bash`, `edit`, etc. — add `directTools` to your config.
+By default, all MCP tools are accessed through the single `mcp` proxy tool. Add `directTools` to register selected MCP tools as typed Pi tools with deferred schemas. They start inactive and are absent from the initial model context. A successful `mcp({ search: "..." })` additively activates selected direct tools returned by that search; activated tools remain available for the session. When deferred direct tools are configured, omitted `includeSchemas` defaults search text to compact/no schemas to avoid duplicating the schemas Pi loads; pass `includeSchemas: true` to include them explicitly. On supported models, Pi serializes this as provider-native tool search/tool references.
 
 Per-server:
 
@@ -484,8 +484,8 @@ Per-server:
 
 | Value | Behavior |
 |-------|----------|
-| `true` | Register all tools from this server as individual Pi tools |
-| `["tool_a", "tool_b"]` | Register only these tools (use original MCP names) |
+| `true` | Register all cached tools from this server as deferred typed Pi tools |
+| `["tool_a", "tool_b"]` | Register only these deferred tools (use original MCP names) |
 | Omitted or `false` | Proxy only (default) |
 
 To set a global default for all servers:
@@ -535,11 +535,13 @@ To hide specific tools while still using `directTools: true`, add `excludeTools`
 
 `includeTools` and `excludeTools` filter direct tools, proxy search/list/describe, and the `/mcp` panel view.
 
-Each direct tool costs ~150-300 tokens in the system prompt (name + description + schema). Good for targeted sets of 5-20 tools. For servers with 75+ tools, stick with the proxy or pick specific tools with a `string[]`. If 75+ direct tools resolve, the adapter prints a warning but still registers the tools you configured.
+Deferred direct schemas do not consume initial tool context. For very large servers, an explicit `string[]` can still keep registration and search focused; resolving 75+ deferred direct tools prints an advisory warning.
 
-Direct tools register from the metadata cache in the Pi agent dir (`~/.pi/agent/mcp-cache.json` by default, or `$PI_CODING_AGENT_DIR/mcp-cache.json` when set), so no server connections are needed at startup. On the first session after adding `directTools` to a new server, the cache won't exist yet — tools fall back to proxy-only while the cache populates, then the extension hot-loads the refreshed direct tools into the current session. Servers that advertise MCP list-change notifications refresh the current session when their tool or resource list changes. On Pi versions that expose `pi.unregisterTool()`, stale direct tools are removed from the registry during refresh; older Pi versions still deactivate them from the active tool set. To force a refresh: `/mcp reconnect <server>`.
+Direct tools register from the metadata cache in the Pi agent dir (`~/.pi/agent/mcp-cache.json` by default, or `$PI_CODING_AGENT_DIR/mcp-cache.json` when set); enabling `directTools` does not add startup connections. On the first search, configured direct-tool servers without valid metadata are lazily discovered before matching: a server-filtered search discovers only that server, while a general search discovers all missing configured direct-tool servers because their tool names are not known yet. Successfully discovered matching tools register inactive and that search activates only its returned page. Failures and authentication requirements leave those servers unavailable to that search without activating tools. Reconnects and list-change notifications refresh registrations. Valid activated tools remain active; stale tools are unregistered when Pi supports it, otherwise deactivated. Search activation only applies to tools selected by `directTools`; all others stay proxy-only. `describe` does not activate tools.
 
-If prompt-cache stability matters more than automatic direct-tool hot-loading, set `settings.freezeDirectTools` to `true`. The initial direct-tool sync still runs, but later automatic reconnects, lazy-connects, and list-change notifications keep the registered tool surface unchanged. Deliberate refreshes through `mcp({ connect: "server" })` or `/mcp reconnect <server>` still update direct tools.
+When `settings.freezeDirectTools` is `true`, automatic metadata updates—including cold-cache search discovery—do not alter direct-tool registrations after the initial sync. Use `mcp({ connect: "server" })` or `/mcp reconnect <server>` for a deliberate registration refresh. `settings.disableProxyTool` is ignored while deferred direct tools are configured because `mcp` search is required to load them.
+
+The active `mcp` loader definition is deliberately stable during cold search discovery: newly found direct schemas register immediately, but the loader's dynamic server/tool summary is not re-registered during its own call. That description refreshes on normal metadata updates, explicit connect/reconnect, or the next session sync.
 
 When you change direct-tool toggles in `/mcp`, the extension updates direct tool registration in the current session. Broader setup writes from `/mcp setup` still use Pi's normal reload flow because they can add or restructure MCP config files.
 
@@ -691,7 +693,7 @@ Advertised tool `outputSchema` values support JSON Schema draft-07 and 2020-12. 
 - npx-based servers resolve to direct binary paths, skipping the ~143 MB npm parent process
 - MCP server validates arguments, not the adapter
 - Keep-alive servers get health checks and auto-reconnect
-- Specific tools can be promoted from the proxy to first-class Pi tools via `directTools` config, so the LLM sees them directly instead of having to search
+- Specific tools can be registered as deferred typed Pi tools via `directTools`; `mcp` search activates matching schemas for the session
 
 ## Limitations
 

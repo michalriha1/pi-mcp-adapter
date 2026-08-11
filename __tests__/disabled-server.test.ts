@@ -94,6 +94,21 @@ describe("disabled MCP servers", () => {
     expect(state.manager.connect).not.toHaveBeenCalled();
   });
 
+  it("fails a removed direct registration closed before connect or auth", async () => {
+    const state = disabledState();
+    state.config.mcpServers.disabled.disabled = false;
+    const execute = createDirectToolExecutor(() => state, () => null, {
+      serverName: "disabled",
+      originalName: "search",
+      prefixedName: "disabled_search",
+      description: "cached",
+    }, () => false);
+
+    const result = await execute("call", {}, undefined, undefined, {} as any);
+    expect(result.details).toMatchObject({ error: "stale_registration", server: "disabled", tool: "search" });
+    expect(state.manager.connect).not.toHaveBeenCalled();
+  });
+
   it("rejects proxy execution and hides disabled cached metadata while listing it in status", async () => {
     const state = disabledState();
     expect(executeStatus(state).content[0].text).toContain("disabled");

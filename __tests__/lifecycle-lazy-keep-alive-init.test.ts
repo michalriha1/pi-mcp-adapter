@@ -132,7 +132,7 @@ describe("lazy-keep-alive initializeMcp integration", () => {
     expect(mocks.manager.connect).toHaveBeenCalledTimes(2);
   });
 
-  it("records direct-tool bootstrap failures", async () => {
+  it("does not connect a lazy server solely to bootstrap direct tools", async () => {
     mkdirSync(tempDir, { recursive: true });
     writeFileSync(mocks.cachePath, JSON.stringify({ version: 1, servers: {} }));
     mocks.config = {
@@ -150,11 +150,12 @@ describe("lazy-keep-alive initializeMcp integration", () => {
       signal: undefined,
     } as any);
 
-    expect(state.failureTracker.has("srv")).toBe(true);
-    expect(state.failureMessages.get("srv")).toBe("bootstrap failed");
+    expect(mocks.manager.connect).not.toHaveBeenCalled();
+    expect(state.failureTracker.has("srv")).toBe(false);
+    expect(state.failureMessages.has("srv")).toBe(false);
   });
 
-  it("clears stale startup diagnostics when direct-tool bootstrap recovers", async () => {
+  it("does not retry a failed startup solely to bootstrap direct tools", async () => {
     mkdirSync(tempDir, { recursive: true });
     writeFileSync(mocks.cachePath, JSON.stringify({ version: 1, servers: {} }));
     mocks.config = {
@@ -172,9 +173,9 @@ describe("lazy-keep-alive initializeMcp integration", () => {
       signal: undefined,
     } as any);
 
-    expect(mocks.manager.connect).toHaveBeenCalledTimes(2);
-    expect(state.failureTracker.has("srv")).toBe(false);
-    expect(state.failureMessages.has("srv")).toBe(false);
+    expect(mocks.manager.connect).toHaveBeenCalledTimes(1);
+    expect(state.failureTracker.has("srv")).toBe(true);
+    expect(state.failureMessages.get("srv")).toBe("startup failed");
   });
 
   it("sanitizes captured diagnostics in startup notifications and terminal logs", async () => {
@@ -279,7 +280,7 @@ describe("lazy-keep-alive initializeMcp integration", () => {
     expect((mocks.cache?.servers.srv as any).resources).toEqual([]);
   });
 
-  it("marks direct-tool metadata bootstrap spawns for health-check reconnects", async () => {
+  it("does not create health-check reconnects for unspawned direct-tool servers", async () => {
     mkdirSync(tempDir, { recursive: true });
     writeFileSync(mocks.cachePath, JSON.stringify({ version: 1, servers: {} }));
     mocks.getMissingConfiguredDirectToolServers.mockReturnValue(["srv"]);
@@ -295,6 +296,6 @@ describe("lazy-keep-alive initializeMcp integration", () => {
     mocks.manager.clear();
     await (state.lifecycle as any).checkConnections();
 
-    expect(mocks.manager.connect).toHaveBeenCalledTimes(2);
+    expect(mocks.manager.connect).not.toHaveBeenCalled();
   });
 });

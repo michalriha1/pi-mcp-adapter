@@ -484,11 +484,11 @@ export interface McpSettings {
   scriptMode?: boolean;
   /** Default approval gate for matching tools/resources; per-server settings override it. */
   approveTools?: boolean | string[];
+  /** Hide the proxy when possible. Ignored while deferred direct tools need `mcp` search as their loader. */
   disableProxyTool?: boolean;
   /** Freeze direct-tool registration after the initial sync. Automatic metadata updates
-   * (reconnects, lazy-connect, tool-list-changed) won't rebuild the system prompt,
-   * preserving the prompt-cache prefix. The agent rediscovers explicitly via
-   * mcp({ connect: "server" }). Default: false. */
+   * (including lazy search discovery and tool-list-changed) do not change registrations;
+   * explicit mcp connect and /mcp reconnect refresh deliberately. Default: false. */
   freezeDirectTools?: boolean;
   autoAuth?: boolean;
   sampling?: boolean;

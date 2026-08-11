@@ -18,6 +18,7 @@ import { formatAuthRequiredMessage, resolveServerUrl, truncateAtWord } from "./u
 import { SessionRecoveryAuthRequiredError, withSessionRecovery } from "./session-recovery.ts";
 import { combineAbortSignals, isAbortError } from "./runtime-owner.ts";
 import { ensureToolCallApproved } from "./tool-approval.ts";
+import { isUiToolVisibleToModel } from "./ui-tool-visibility.ts";
 
 type ClientCallToolResult = Awaited<ReturnType<Client["callTool"]>>;
 type ClientReadResourceResult = Awaited<ReturnType<Client["readResource"]>>;
@@ -151,6 +152,7 @@ export function resolveDirectTools(
     const effectivePrefix = resolveToolPrefix(definition, prefix);
 
     for (const tool of serverCache.tools ?? []) {
+      if (!isUiToolVisibleToModel(tool.uiVisibility)) continue;
       if (toolFilter !== true && !toolFilter.includes(tool.name)) continue;
       if (!isToolAllowed(tool.name, serverName, effectivePrefix, definition.includeTools, definition.excludeTools)) continue;
       const prefixedName = formatToolName(tool.name, serverName, effectivePrefix);
@@ -201,7 +203,7 @@ export function resolveDirectTools(
   }
 
   if (specs.length >= DIRECT_TOOLS_ADVISORY_THRESHOLD) {
-    console.warn(`MCP: ${specs.length} direct tools resolved. Each direct tool adds prompt context; README guidance recommends targeted sets of 5-20 tools and using the proxy or an explicit string[] when 75+ direct tools would be registered.`);
+    console.warn(`MCP: ${specs.length} deferred direct tools resolved; consider an explicit string[] to keep tool search focused.`);
   }
 
   return specs;
@@ -223,7 +225,7 @@ export function buildProxyDescription(
     const parts = [...directByServer.entries()].map(
       ([server, count]) => `${server} (${count})`,
     );
-    desc += `\nDirect tools available (call as normal tools): ${parts.join(", ")}\n`;
+    desc += `\nDeferred direct tools registered (activate with search): ${parts.join(", ")}\n`;
   }
 
   const serverSummaries: string[] = [];
@@ -233,7 +235,8 @@ export function buildProxyDescription(
     const entry = cache?.servers?.[serverName];
     const effectivePrefix = resolveToolPrefix(definition, prefix);
     const toolCount = (entry?.tools ?? []).filter(
-      (tool) => isToolAllowed(tool.name, serverName, effectivePrefix, definition.includeTools, definition.excludeTools),
+      (tool) => isUiToolVisibleToModel(tool.uiVisibility)
+        && isToolAllowed(tool.name, serverName, effectivePrefix, definition.includeTools, definition.excludeTools),
     ).length;
     const resourceCount = definition?.exposeResources !== false
       ? (entry?.resources ?? []).filter((resource) => {
@@ -300,7 +303,8 @@ type DirectToolExecute = (
 export function createDirectToolExecutor(
   getState: () => McpExtensionState | null,
   getInitPromise: () => Promise<McpExtensionState> | null,
-  spec: DirectToolSpec
+  spec: DirectToolSpec,
+  isCurrentRegistration: () => boolean = () => true,
 ): DirectToolExecute {
   return async function execute(_toolCallId, params, signal) {
     throwIfAborted(signal);
@@ -326,6 +330,13 @@ export function createDirectToolExecutor(
     }
 
     const definition = state.config.mcpServers[spec.serverName];
+    if (!isCurrentRegistration()) {
+      const message = `MCP tool "${spec.prefixedName}" is no longer current. Search again or start a new session to load refreshed metadata.`;
+      return {
+        content: [{ type: "text" as const, text: message }],
+        details: { error: "stale_registration", server: spec.serverName, tool: spec.originalName, message },
+      };
+    }
     if (isServerDisabled(definition)) {
       const message = `MCP server "${spec.serverName}" is disabled. Run /mcp enable ${spec.serverName} and /reload to enable it.`;
       return {

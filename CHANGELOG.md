@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Changed `directTools` to register inactive typed Pi tools whose schemas are additively loaded by successful `mcp` searches, enabling Pi's provider-native deferred tool-search flow without eager server startup. Cold-cache searches lazily discover configured direct-tool servers. The `mcp` search loader remains available, so `disableProxyTool` is ignored while deferred direct tools are configured; `freezeDirectTools` continues to freeze automatic registration refreshes.
+
 ### Fixed
 - Stopped load-time MCP initialization from printing a TUI startup error when Pi action methods are not bound yet. Thanks @21307369 for issue #327.
 

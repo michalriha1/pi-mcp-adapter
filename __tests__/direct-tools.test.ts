@@ -116,6 +116,30 @@ describe("buildProxyDescription", () => {
     expect(description).not.toContain("figma (3 tools)");
   });
 
+  it("excludes model-hidden MCP UI tools from direct resolution and proxy counts", () => {
+    const config: McpConfig = {
+      mcpServers: { demo: { command: "demo", directTools: true } },
+    };
+    const cache: MetadataCache = {
+      version: 1,
+      servers: {
+        demo: {
+          configHash: computeServerHash(config.mcpServers.demo),
+          cachedAt: Date.now(),
+          tools: [
+            { name: "visible", uiVisibility: ["model"] },
+            { name: "app_only", uiVisibility: ["app"] },
+          ],
+          resources: [],
+        },
+      },
+    };
+
+    expect(resolveDirectTools(config, cache, "server").map(spec => spec.originalName)).toEqual(["visible"]);
+    expect(buildProxyDescription(config, cache, [])).toContain("Servers: demo (1 tools)");
+    expect(buildProxyDescription(config, cache, [])).not.toContain("demo (2 tools)");
+  });
+
   it("includes a truncated instructions snippet for servers that provide one", () => {
     const config: McpConfig = {
       mcpServers: {
@@ -595,7 +619,7 @@ describe("excludeTools filtering", () => {
     const specs = resolveDirectTools(config, cache, "server");
 
     expect(specs).toHaveLength(DIRECT_TOOLS_ADVISORY_THRESHOLD);
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining("75+ direct tools"));
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("deferred direct tools"));
   });
 
   it("filters included tools during direct tool registration from cache", () => {

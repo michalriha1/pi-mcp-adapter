@@ -2,10 +2,18 @@ import { execFile } from "node:child_process";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 
-const execFileAsync = promisify(execFile);
+// Generic promisify resolves only execFile's first callback value on supported
+// Node versions here, dropping stderr. Keep this wrapper local to the child test.
+function execFileAsync(file: string, args: string[], options: Parameters<typeof execFile>[2]): Promise<{ stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    execFile(file, args, { ...options, encoding: "utf8" }, (error, stdout, stderr) => {
+      if (error) reject(error);
+      else resolve({ stdout: String(stdout), stderr: String(stderr) });
+    });
+  });
+}
 const roots: string[] = [];
 
 afterEach(async () => {
@@ -13,7 +21,7 @@ afterEach(async () => {
 });
 
 describe("direct tools in child Pi processes", () => {
-  it("registers an env-selected cold-cache tool before agent_start", async () => {
+  it("keeps an env-selected cold-cache server lazy before explicit discovery", async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-mcp-direct-tool-child-"));
     roots.push(root);
     const agentDir = join(root, "agent");
@@ -50,6 +58,6 @@ describe("direct tools in child Pi processes", () => {
     expect(stderr).not.toContain("MCP initialization failed");
     const toolsLine = stdout.split("\n").find(line => line.startsWith("DIRECT_TOOLS_AT_AGENT_START="));
     expect(toolsLine).toBeDefined();
-    expect(JSON.parse(toolsLine!.slice("DIRECT_TOOLS_AT_AGENT_START=".length))).toContain("demo_reload_identity");
+    expect(JSON.parse(toolsLine!.slice("DIRECT_TOOLS_AT_AGENT_START=".length))).not.toContain("demo_reload_identity");
   }, 20_000);
 });

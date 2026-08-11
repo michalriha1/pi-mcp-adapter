@@ -1,6 +1,6 @@
 import type { AgentToolUpdateCallback, ExtensionAPI, ExtensionContext, ToolInfo } from "@earendil-works/pi-coding-agent";
 import type { McpExtensionState } from "./state.ts";
-import type { DirectToolSpec, McpAdapterOptions, McpConfig, PromptMetadata } from "./types.ts";
+import { isServerDisabled, type DirectToolSpec, type McpAdapterOptions, type McpConfig, type PromptMetadata } from "./types.ts";
 import type { McpOAuthRuntime } from "./mcp-auth-flow.ts";
 import { Type } from "typebox";
 import type { TSchema } from "typebox";
@@ -12,7 +12,7 @@ import { loadMetadataCache, type MetadataCache } from "./metadata-cache.ts";
 import { createPromptCommand, resolveCachedPrompts } from "./prompts.ts";
 import { logger } from "./logger.ts";
 import { executeAuthComplete, executeAuthStart, executeCall, executeConnect, executeDescribe, executeInstructions, executeList, executeSearch, executeStatus, executeUiMessages } from "./proxy-modes.ts";
-import { formatTerminalError, getConfigPathFromArgv, normalizeDirectToolInputSchema, truncateAtWord } from "./utils.ts";
+import { formatTerminalError, getConfigPathFromArgv, normalizeDirectToolInputSchema } from "./utils.ts";
 import { createOAuthRuntime, shutdownOAuth } from "./mcp-auth-flow.ts";
 import { createMcpDirectToolCallRenderer, renderMcpProxyToolCall, renderMcpToolResult } from "./tool-result-renderer.ts";
 import { toolErrorOverride } from "./error-signal.ts";
@@ -123,7 +123,11 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
   const envRaw = process.env.MCP_DIRECT_TOOLS;
   const envDirectToolOverride = envRaw?.split(",").map(s => s.trim()).filter(Boolean);
   const registeredDirectTools = new Map<string, string>();
-  const fallbackDeactivatedTools = new Set<string>();
+  const directToolSpecs = new Map<string, DirectToolSpec>();
+  const activatedDirectTools = new Set<string>();
+  const invalidDirectTools = new Set<string>();
+  const pendingStaleToolCleanup = new Set<string>();
+  let searchDiscoveryState: McpExtensionState | null = null;
   let proxyToolRegistered = false;
   let proxyToolDescription: string | null = null;
   let directToolsFrozen = false;
@@ -155,9 +159,15 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
       name: spec.prefixedName,
       label: `MCP: ${spec.originalName}`,
       description: spec.description || "(no description)",
-      promptSnippet: truncateAtWord(spec.description, 100) || `MCP tool from ${spec.serverName}`,
       parameters: toToolParameters(normalizeDirectToolInputSchema(spec.inputSchema)),
-      execute: createDirectToolExecutor(() => state, () => initPromise, spec),
+      execute: createDirectToolExecutor(
+        () => state,
+        () => initPromise,
+        spec,
+        () => !invalidDirectTools.has(spec.prefixedName)
+          && registeredDirectTools.get(spec.prefixedName) === directToolFingerprint(spec)
+          && directToolSpecs.get(spec.prefixedName) === spec,
+      ),
       renderCall: createMcpDirectToolCallRenderer(spec.prefixedName),
       renderResult: renderMcpToolResult,
     });
@@ -167,6 +177,15 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
     if (envRaw === "__none__") return [];
     const prefix = config.settings?.toolPrefix ?? "server";
     return resolveDirectTools(config, cache, prefix, envDirectToolOverride);
+  }
+
+  function hasConfiguredDirectTools(config: McpConfig): boolean {
+    if (envRaw === "__none__") return false;
+    if (envRaw !== undefined) return (envDirectToolOverride?.length ?? 0) > 0;
+    const globalDirect = config.settings?.directTools;
+    return Object.values(config.mcpServers).some((definition) =>
+      !isServerDisabled(definition)
+      && (definition.directTools !== undefined ? !!definition.directTools : !!globalDirect));
   }
 
   function getActiveToolsIfReady(): string[] | undefined {
@@ -179,26 +198,68 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
     }
   }
 
-  function deactivateTools(toolNames: string[]): string[] {
-    if (toolNames.length === 0) return [];
-    const unregisterTool = (pi as ExtensionAPI & { unregisterTool?: (name: string) => boolean }).unregisterTool;
-    const unregistered = toolNames.filter((toolName) => unregisterTool?.(toolName) === true);
-    const fallbackNames = toolNames.filter((toolName) => !unregistered.includes(toolName));
+  function setToolsInactive(toolNames: string[]): void {
+    if (toolNames.length === 0) return;
     const remove = new Set(toolNames);
     const activeTools = getActiveToolsIfReady();
-    if (!activeTools || activeTools.length === 0) {
-      for (const toolName of fallbackNames) fallbackDeactivatedTools.add(toolName);
-      return unregistered;
-    }
+    if (!activeTools) return;
     const nextActiveTools = activeTools.filter((name) => !remove.has(name));
-    if (nextActiveTools.length !== activeTools.length) {
-      for (const toolName of fallbackNames) fallbackDeactivatedTools.add(toolName);
-      pi.setActiveTools(nextActiveTools);
-    }
-    return unregistered;
+    if (nextActiveTools.length !== activeTools.length) pi.setActiveTools(nextActiveTools);
   }
 
-  function syncDirectTools(config: McpConfig, cache: MetadataCache | null): {
+  function unregisterTools(toolNames: string[]): void {
+    if (toolNames.length === 0) return;
+    const unregisterTool = (pi as ExtensionAPI & { unregisterTool?: (name: string) => boolean }).unregisterTool;
+    for (const toolName of toolNames) unregisterTool?.(toolName);
+    setToolsInactive(toolNames);
+  }
+
+  function deactivateDeferredDirectTools(): void {
+    setToolsInactive([...registeredDirectTools.keys()].filter((name) => !activatedDirectTools.has(name)));
+  }
+
+  function cleanSearchActiveTools(
+    activeSnapshot: readonly string[],
+    autoActivatedCandidates: readonly string[],
+  ): string[] {
+    const current = getActiveToolsIfReady() ?? [...activeSnapshot];
+    const entryNames = new Set(activeSnapshot);
+    const remove = new Set(autoActivatedCandidates.filter((name) => !entryNames.has(name)));
+    const cleaned = current.filter((name) => !remove.has(name));
+    const cleanedNames = new Set(cleaned);
+    for (const name of activeSnapshot) {
+      if (!cleanedNames.has(name)) {
+        cleaned.push(name);
+        cleanedNames.add(name);
+      }
+    }
+    if (cleaned.length !== current.length || cleaned.some((name, index) => name !== current[index])) {
+      pi.setActiveTools(cleaned);
+    }
+    return cleaned;
+  }
+
+  function activateSearchedDirectTools(matches: unknown, cleanedActive: string[]): void {
+    if (!Array.isArray(matches)) return;
+    const active = new Set(cleanedActive);
+    const additions: string[] = [];
+    for (const match of matches) {
+      if (!match || typeof match !== "object") continue;
+      const { server, tool } = match as { server?: unknown; tool?: unknown };
+      if (typeof server !== "string" || typeof tool !== "string") continue;
+      const spec = directToolSpecs.get(tool);
+      if (!spec || spec.serverName !== server || activatedDirectTools.has(tool)) continue;
+      activatedDirectTools.add(tool);
+      if (!active.has(tool)) additions.push(tool);
+    }
+    if (additions.length > 0) pi.setActiveTools([...cleanedActive, ...additions]);
+  }
+
+  function syncDirectTools(
+    config: McpConfig,
+    cache: MetadataCache | null,
+    options: { deferStaleCleanup?: boolean; onlyServers?: ReadonlySet<string>; skipActiveCleanup?: boolean } = {},
+  ): {
     specs: DirectToolSpec[];
     added: string[];
     updated: string[];
@@ -211,28 +272,43 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
     const deactivated: string[] = [];
 
     for (const spec of specs) {
+      if (options.onlyServers && !options.onlyServers.has(spec.serverName)) continue;
       const fingerprint = directToolFingerprint(spec);
       const previous = registeredDirectTools.get(spec.prefixedName);
-      if (previous !== fingerprint) {
-        registerDirectTool(spec);
-        registeredDirectTools.set(spec.prefixedName, fingerprint);
-        if (fallbackDeactivatedTools.delete(spec.prefixedName)) {
-          const activeTools = getActiveToolsIfReady();
-          if (activeTools && !activeTools.includes(spec.prefixedName)) {
-            pi.setActiveTools([...activeTools, spec.prefixedName]);
-          }
-        }
-        (previous ? updated : added).push(spec.prefixedName);
+      if (previous === fingerprint) {
+        if (!directToolSpecs.has(spec.prefixedName)) directToolSpecs.set(spec.prefixedName, spec);
+        continue;
       }
+      if (previous !== undefined && activatedDirectTools.has(spec.prefixedName)) {
+        // An activated schema is immutable for this session. Keep its old
+        // definition registered for wrapper stability, but fail its executor
+        // closed until the refreshed definition is installed next session.
+        invalidDirectTools.add(spec.prefixedName);
+        continue;
+      }
+      invalidDirectTools.delete(spec.prefixedName);
+      directToolSpecs.set(spec.prefixedName, spec);
+      registerDirectTool(spec);
+      registeredDirectTools.set(spec.prefixedName, fingerprint);
+      (previous ? updated : added).push(spec.prefixedName);
     }
 
-    for (const toolName of [...registeredDirectTools.keys()]) {
+    for (const [toolName, spec] of [...directToolSpecs.entries()]) {
+      if (options.onlyServers && !options.onlyServers.has(spec.serverName)) continue;
       if (nextNames.has(toolName)) continue;
+      directToolSpecs.delete(toolName);
       registeredDirectTools.delete(toolName);
+      activatedDirectTools.delete(toolName);
+      invalidDirectTools.delete(toolName);
       deactivated.push(toolName);
     }
 
-    deactivateTools(deactivated);
+    if (options.deferStaleCleanup) {
+      for (const name of deactivated) pendingStaleToolCleanup.add(name);
+    } else {
+      unregisterTools(deactivated);
+    }
+    if (!options.skipActiveCleanup) deactivateDeferredDirectTools();
     return { specs, added, updated, deactivated };
   }
 
@@ -245,11 +321,19 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
     }
   }
 
-  function syncToolSurface(ctx?: ExtensionContext): void {
+  function syncToolSurface(
+    ctx?: ExtensionContext,
+    options: {
+      deferStaleCleanup?: boolean;
+      onlyServers?: ReadonlySet<string>;
+      skipActiveCleanup?: boolean;
+      refreshProxy?: boolean;
+    } = {},
+  ): ReturnType<typeof syncDirectTools> {
     const config = state?.config ?? earlyConfig;
     const cache = loadMetadataCache();
-    const result = syncDirectTools(config, cache);
-    syncProxyTool(config, cache, result.specs);
+    const result = syncDirectTools(config, cache, options);
+    if (options.refreshProxy !== false) syncProxyTool(config, cache, result.specs);
     const changed = result.added.length + result.updated.length + result.deactivated.length;
     if (changed > 0 && ctx?.hasUI) {
       ctx.ui.notify(
@@ -257,6 +341,7 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
         "info",
       );
     }
+    return result;
   }
 
   const registeredPromptCommands = new Set<string>();
@@ -310,11 +395,11 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
       }
 
       state = nextState;
-      nextState.onToolMetadataUpdated = (_serverName, _reason) => {
+      nextState.onToolMetadataUpdated = (serverName, reason) => {
         if (state !== nextState || !owner.isActive()) return;
         syncPromptCommands();
-        if (directToolsFrozen) {
-          logger.debug(`MCP: metadata update for ${_serverName} (${_reason}) skipped — directTools frozen`);
+        if (directToolsFrozen || searchDiscoveryState === nextState) {
+          logger.debug(`MCP: metadata update for ${serverName} (${reason}) skipped — directTools ${directToolsFrozen ? "frozen" : "search discovery in progress"}`);
           return;
         }
         syncToolSurface(ctx);
@@ -323,9 +408,9 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
       syncToolSurface(ctx);
       updateStatusBar(nextState);
       initPromise = null;
-      if (earlyConfig.settings?.freezeDirectTools === true) {
+      if (nextState.config.settings?.freezeDirectTools === true) {
         directToolsFrozen = true;
-        logger.info("MCP: direct tools frozen after initial sync — reconnects won't rebuild the system prompt; use mcp({ connect: \"server\" }) to rediscover");
+        logger.info("MCP: direct tools frozen after initial sync — automatic metadata refreshes won't change registrations; use mcp({ connect: \"server\" }) or /mcp reconnect to refresh deliberately");
       }
     }).catch(async err => {
       if (!owner.isActive() || generation !== lifecycleGeneration) {
@@ -374,6 +459,11 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
   }
 
   pi.on("session_start", async (_event, ctx) => {
+    activatedDirectTools.clear();
+    invalidDirectTools.clear();
+    pendingStaleToolCleanup.clear();
+    directToolsFrozen = false;
+    deactivateDeferredDirectTools();
     const generation = ++lifecycleGeneration;
     const previousState = state;
     const previousOwner = currentOwner;
@@ -400,17 +490,14 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
 
     if (generation !== lifecycleGeneration || !owner.isActive()) return;
 
-    const initialization = startInitialization(ctx, owner, oauthRuntime, generation, "stale_session_start");
-    if (envRaw !== undefined && envRaw !== "__none__") {
-      const missingEnvDirectTools = getMissingConfiguredDirectToolServers(
-        earlyConfig,
-        loadMetadataCache(),
-        envDirectToolOverride,
-      );
-      if (missingEnvDirectTools.length > 0) {
-        await initialization;
-      }
-    }
+    startInitialization(ctx, owner, oauthRuntime, generation, "stale_session_start");
+  });
+
+  pi.on("tool_execution_end", (event) => {
+    if (event.toolName !== "mcp" || pendingStaleToolCleanup.size === 0) return;
+    const stale = [...pendingStaleToolCleanup];
+    pendingStaleToolCleanup.clear();
+    unregisterTools(stale);
   });
 
   pi.on("session_shutdown", async () => {
@@ -509,7 +596,7 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
         case "reconnect":
           commandOwner?.throwIfInactive();
           await reconnectServers(state, commandCtx, targetServer);
-          if (directToolsFrozen) syncToolSurface(commandCtx);
+          syncToolSurface(commandCtx);
           break;
         case "tools":
           await showTools(state, commandCtx);
@@ -695,6 +782,7 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
       label: "MCP",
       description,
       promptSnippet: "MCP gateway — status, search, describe, auth, and single MCP tool calls",
+      executionMode: "sequential",
       renderCall: renderMcpProxyToolCall,
       parameters: Type.Object({
         tool: Type.Optional(Type.String({ description: "Tool name to call (e.g., 'xcodebuild_list_sims')" })),
@@ -710,7 +798,7 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
         instructions: Type.Optional(Type.String({ description: "Server name to show that server's usage instructions" })),
         search: Type.Optional(Type.String({ description: "Search tools by name/description" })),
         regex: Type.Optional(Type.Boolean({ description: "Treat search as regex (default: substring match)" })),
-        includeSchemas: Type.Optional(Type.Boolean({ description: "Include parameter schemas in search results (default: true)" })),
+        includeSchemas: Type.Optional(Type.Boolean({ description: "Include parameter schemas in search results (default: false when deferred direct tools are configured; otherwise true)" })),
         limit: optionalNumber({ minimum: 1, description: "Maximum search results to return (default: 12)" }),
         offset: optionalNumber({ minimum: 0, description: "Search result offset (default: 0)" }),
         server: Type.Optional(Type.String({ description: "Filter to specific server (also disambiguates tool calls)" })),
@@ -820,7 +908,9 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
         }
         if (params.connect) {
           const result = await executeConnect(state, params.connect, signal);
-          syncToolSurface(_ctx as ExtensionContext);
+          if (!(result.details as { error?: unknown } | undefined)?.error) {
+            syncToolSurface(_ctx as ExtensionContext);
+          }
           return result;
         }
         if (params.describe) {
@@ -830,7 +920,80 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
           return executeInstructions(state, params.instructions);
         }
         if (params.search !== undefined) {
-          return executeSearch(state, params.search, params.regex, params.server, params.includeSchemas, params.limit, params.offset);
+          // Pi's registered-tool wrapper attributes every active-name delta during
+          // execute() to this loader. Preserve the complete host snapshot, not
+          // merely names tracked by this adapter.
+          const searchState = state;
+          const activeSnapshot = getActiveToolsIfReady() ?? [];
+          const discoveryCache = loadMetadataCache();
+          const missingDirectServers = envRaw === "__none__"
+            ? []
+            : getMissingConfiguredDirectToolServers(
+                searchState.config,
+                discoveryCache,
+                envRaw === undefined ? undefined : envDirectToolOverride,
+              ).filter((serverName) => params.server === undefined || serverName === params.server);
+          const successfulDiscoveries = new Set<string>();
+          const failedDiscoveries = new Set<string>();
+
+          searchDiscoveryState = searchState;
+          try {
+            for (const serverName of missingDirectServers) {
+              signal?.throwIfAborted();
+              executeOwner?.throwIfInactive();
+              const discovery = await executeConnect(searchState, serverName, signal);
+              signal?.throwIfAborted();
+              executeOwner?.throwIfInactive();
+              if ((discovery.details as { error?: unknown } | undefined)?.error) {
+                failedDiscoveries.add(serverName);
+                continue;
+              }
+              successfulDiscoveries.add(serverName);
+            }
+          } finally {
+            if (searchDiscoveryState === searchState) searchDiscoveryState = null;
+          }
+
+          let autoActivatedCandidates: string[] = [];
+          if (!directToolsFrozen && successfulDiscoveries.size > 0) {
+            // Keep the currently executing loader definition stable. Direct schemas
+            // register now; proxy-description refresh waits for a later normal sync.
+            const syncResult = syncToolSurface(_ctx, {
+              deferStaleCleanup: true,
+              onlyServers: successfulDiscoveries,
+              skipActiveCleanup: true,
+              refreshProxy: false,
+            });
+            autoActivatedCandidates = [...syncResult.added, ...syncResult.updated];
+          }
+          const cleanedActive = cleanSearchActiveTools(activeSnapshot, autoActivatedCandidates);
+
+          const includeSchemas = params.includeSchemas
+            ?? (hasConfiguredDirectTools(searchState.config) ? false : undefined);
+          const result = executeSearch(
+            searchState,
+            params.search,
+            params.regex,
+            params.server,
+            includeSchemas,
+            params.limit,
+            params.offset,
+          );
+          if (!(result.details as { error?: unknown } | undefined)?.error) {
+            const matches = (result.details as { matches?: unknown } | undefined)?.matches;
+            activateSearchedDirectTools(
+              Array.isArray(matches)
+                ? matches.filter((match) => {
+                    const server = match && typeof match === "object"
+                      ? (match as { server?: unknown }).server
+                      : undefined;
+                    return typeof server !== "string" || !failedDiscoveries.has(server);
+                  })
+                : matches,
+              cleanedActive,
+            );
+          }
+          return result;
         }
         if (params.server) {
           return executeList(state, params.server);
@@ -843,35 +1006,16 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
   }
 
   function syncProxyTool(config: McpConfig, cache: MetadataCache | null, directSpecs: DirectToolSpec[]): void {
-    const missingConfiguredDirectToolServers = getMissingConfiguredDirectToolServers(
-      config,
-      cache,
-      envRaw === undefined || envRaw === "__none__" ? undefined : envDirectToolOverride,
-    );
-    const shouldRegisterProxyTool =
-      config.settings?.disableProxyTool !== true
-      || directSpecs.length === 0
-      || missingConfiguredDirectToolServers.length > 0;
-
-    if (shouldRegisterProxyTool) {
-      const description = buildProxyDescription(config, cache, directSpecs);
-      if (!proxyToolRegistered || proxyToolDescription !== description) {
-        registerProxyTool(description);
-        return;
-      }
-      const activeTools = getActiveToolsIfReady();
-      if (activeTools && !activeTools.includes("mcp")) {
-        pi.setActiveTools([...activeTools, "mcp"]);
-      }
+    // Deferred direct tools are loaded only through mcp search, so the proxy
+    // remains available even when disableProxyTool was configured previously.
+    const description = buildProxyDescription(config, cache, directSpecs);
+    if (!proxyToolRegistered || proxyToolDescription !== description) {
+      registerProxyTool(description);
       return;
     }
-
-    if (proxyToolRegistered) {
-      const unregistered = deactivateTools(["mcp"]);
-      if (unregistered.includes("mcp")) {
-        proxyToolRegistered = false;
-        proxyToolDescription = null;
-      }
+    const activeTools = getActiveToolsIfReady();
+    if (activeTools && !activeTools.includes("mcp")) {
+      pi.setActiveTools([...activeTools, "mcp"]);
     }
   }
 

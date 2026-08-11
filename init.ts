@@ -8,7 +8,6 @@ import { McpLifecycleManager } from "./lifecycle.ts";
 import {
   computeServerHash,
   getMetadataCachePath,
-  getMissingConfiguredDirectToolServers,
   isServerCacheValid,
   loadMetadataCache,
   reconstructPromptMetadata,
@@ -333,50 +332,6 @@ export async function initializeMcp(
       ? `MCP: ${connectedCount}/${startupServers.length} servers connected (${totalTools} tools)`
       : `MCP: ${connectedCount} servers connected (${totalTools} tools)`;
     ui.notify(msg, "info");
-  }
-
-  const envDirect = process.env.MCP_DIRECT_TOOLS;
-  if (envDirect !== "__none__") {
-    const currentCache = loadMetadataCache();
-    const envDirectToolOverride = envDirect?.split(",").map(selector => selector.trim()).filter(Boolean);
-    const missingCacheServers = getMissingConfiguredDirectToolServers(config, currentCache, envDirectToolOverride);
-
-    if (missingCacheServers.length > 0) {
-      const bootstrapResults = await parallelLimit(
-        missingCacheServers.filter(name => !results.some(r => r.name === name && r.connection)),
-        10,
-        async (name) => {
-          try {
-            const definition = config.mcpServers[name];
-            if (!definition) throw new Error(`MCP server "${name}" is not configured`);
-            const connection = await manager.connect(name, definition, runtimeSignal);
-            if (connection.status === "needs-auth") {
-              return { name, ok: false };
-            }
-            updateServerMetadata(state, name);
-            updateMetadataCache(state, name);
-            notifyToolMetadataUpdated(state, name, "direct-tools-bootstrap");
-            markKeepAliveAfterConnect(state, name);
-            clearFailure(state, name);
-            return { name, ok: true };
-          } catch (error) {
-            if (isAbortError(error, runtimeSignal)) {
-              if (owner.signal.aborted) throw error;
-              return { name, ok: false };
-            }
-            const message = error instanceof Error ? error.message : String(error);
-            recordFailure(state, name, message);
-            logger.debug(`MCP: direct-tools bootstrap failed for ${name}: ${sanitizeTerminalText(message)}`);
-            return { name, ok: false };
-          }
-        },
-      );
-      const bootstrapped = bootstrapResults.filter(r => r.ok).map(r => r.name);
-      owner.throwIfInactive();
-      if (bootstrapped.length > 0 && ui) {
-        ui.notify(`MCP: direct tools for ${bootstrapped.join(", ")} will be available after restart`, "info");
-      }
-    }
   }
 
   lifecycle.setReconnectCallback((serverName) => {

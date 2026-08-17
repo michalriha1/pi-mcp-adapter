@@ -589,7 +589,7 @@ describe("excludeTools filtering", () => {
     expect(specs.map((spec) => spec.prefixedName)).toEqual(["github_search"]);
   });
 
-  it("warns without capping when resolved direct tools exceed the README threshold", () => {
+  it("does not cap or warn when resolved direct tools exceed the README threshold", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const tools = Array.from({ length: DIRECT_TOOLS_ADVISORY_THRESHOLD }, (_, index) => ({
       name: `tool_${index}`,
@@ -619,7 +619,7 @@ describe("excludeTools filtering", () => {
     const specs = resolveDirectTools(config, cache, "server");
 
     expect(specs).toHaveLength(DIRECT_TOOLS_ADVISORY_THRESHOLD);
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining("deferred direct tools"));
+    expect(warn).not.toHaveBeenCalled();
   });
 
   it("filters included tools during direct tool registration from cache", () => {

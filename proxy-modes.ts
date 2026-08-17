@@ -461,7 +461,7 @@ export function executeSearch(
   regex?: boolean,
   server?: string,
   includeSchemas?: boolean,
-  limit = 12,
+  limit = 5,
   offset = 0,
 ): ProxyToolResult {
   const showSchemas = includeSchemas !== false;

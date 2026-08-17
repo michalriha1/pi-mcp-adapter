@@ -535,7 +535,7 @@ To hide specific tools while still using `directTools: true`, add `excludeTools`
 
 `includeTools` and `excludeTools` filter direct tools, proxy search/list/describe, and the `/mcp` panel view.
 
-Deferred direct schemas do not consume initial tool context. For very large servers, an explicit `string[]` can still keep registration and search focused; resolving 75+ deferred direct tools prints an advisory warning.
+Deferred direct schemas do not consume initial tool context. For very large servers, an explicit `string[]` can still keep registration and search focused; the 75+ deferred direct tools advisory warning is disabled in this fork (`DIRECT_TOOLS_ADVISORY_ENABLED`).
 
 Direct tools register from the metadata cache in the Pi agent dir (`~/.pi/agent/mcp-cache.json` by default, or `$PI_CODING_AGENT_DIR/mcp-cache.json` when set); enabling `directTools` does not add startup connections. On the first search, configured direct-tool servers without valid metadata are lazily discovered before matching: a server-filtered search discovers only that server, while a general search discovers all missing configured direct-tool servers because their tool names are not known yet. Successfully discovered matching tools register inactive and that search activates only its returned page. Failures and authentication requirements leave those servers unavailable to that search without activating tools. Reconnects and list-change notifications refresh registrations. Valid activated tools remain active; stale tools are unregistered when Pi supports it, otherwise deactivated. Search activation only applies to tools selected by `directTools`; all others stay proxy-only. `describe` does not activate tools.
 
@@ -650,7 +650,7 @@ Prefer `.mcp.json` for project-local shared MCP config. Use `.pi/mcp.json` only 
 
 MCP proxy and direct-tool results render compactly by default: long text shows the first three terminal-wrapped lines plus a `Ctrl+O to expand` hint, while the full result remains available when expanded and is still returned unchanged to the model.
 
-Search includes both MCP tools and Pi tools (from extensions). Pi tools appear first with `[pi tool]` prefix. Space-separated words are ranked by weighted matches across name, server, and description, then returned one page at a time (`limit` defaults to 12). Use `details.nextOffset` for the next page. Regex search is still available with `regex: true`, but regex results are paginated without ranking.
+Search includes both MCP tools and Pi tools (from extensions). Pi tools appear first with `[pi tool]` prefix. Space-separated words are ranked by weighted matches across name, server, and description, then returned one page at a time (`limit` defaults to 5). Use `details.nextOffset` for the next page. Regex search is still available with `regex: true`, but regex results are paginated without ranking.
 
 Tool names are fuzzy-matched on hyphens and underscores — `context7_resolve_library_id` finds `context7_resolve-library-id`. When `describe` or `tool` cannot resolve a name, the result includes top suggestions so the agent can correct a typo or missing prefix in the same turn.
 

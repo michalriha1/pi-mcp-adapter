@@ -26,6 +26,8 @@ type ClientReadResourceResult = Awaited<ReturnType<Client["readResource"]>>;
 const BUILTIN_NAMES = new Set(["read", "bash", "edit", "write", "grep", "find", "ls", "mcp"]);
 const INSTRUCTIONS_SNIPPET_LENGTH = 150;
 export const DIRECT_TOOLS_ADVISORY_THRESHOLD = 75;
+// Advisory is noise for large multi-server setups; search limit caps activation per call.
+export const DIRECT_TOOLS_ADVISORY_ENABLED = false;
 
 type DirectAutoAuthResult =
   | { status: "skipped" }
@@ -202,7 +204,7 @@ export function resolveDirectTools(
     }
   }
 
-  if (specs.length >= DIRECT_TOOLS_ADVISORY_THRESHOLD) {
+  if (DIRECT_TOOLS_ADVISORY_ENABLED && specs.length >= DIRECT_TOOLS_ADVISORY_THRESHOLD) {
     console.warn(`MCP: ${specs.length} deferred direct tools resolved; consider an explicit string[] to keep tool search focused.`);
   }
 
